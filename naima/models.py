@@ -16,11 +16,14 @@ from .extern.validator import (
     validate_array,
     validate_physical_type,
 )
-from .radiative import Synchrotron, InverseCompton, PionDecay, Bremsstrahlung
+from .radiative import Synchrotron, TurbSynch, TurbSynchProt, ProtonSynch, InverseCompton, PionDecay, Bremsstrahlung
 from .model_utils import memoize
 
 __all__ = [
     "Synchrotron",
+    "TurbSynch",
+    "ProtonSynch",
+    "TurbSynchProt",
     "InverseCompton",
     "PionDecay",
     "Bremsstrahlung",
@@ -340,6 +343,7 @@ class ExponentialCutoffBrokenPowerLaw(object):
         K = np.where(e < e_break, 1, (e_break / e_0) ** (alpha_2 - alpha_1))
         alpha = np.where(e < e_break, alpha_1, alpha_2)
         ee2 = e / e_cutoff
+        #print(amplitude * K * (e / e_0) ** -alpha * np.exp(-(ee2 ** beta)))
         return amplitude * K * (e / e_0) ** -alpha * np.exp(-(ee2 ** beta))
 
     @memoize
@@ -351,6 +355,127 @@ class ExponentialCutoffBrokenPowerLaw(object):
             self.e_break.to("eV").value,
             self.alpha_1,
             self.alpha_2,
+            self.e_cutoff.to("eV").value,
+            self.beta,
+        )
+
+    def __call__(self, e):
+        """One dimensional broken power law model with exponential cutoff
+        function"""
+        e = _validate_ene(e)
+        return self._calc(e)
+
+
+class ExponentialCutoffDoubleBrokenPowerLaw(object):
+    """
+    One dimensional power law model with 2 breaks and a cutoff.
+
+    Parameters
+    ----------
+    amplitude : float
+        Model amplitude at the break point
+    e_0 : `~astropy.units.Quantity` float
+        Reference point
+    e_break1 : `~astropy.units.Quantity` float
+        First break energy
+    e_break2 : `~astropy.units.Quantity` float
+        Second break energy
+    alpha_1 : float
+        Power law index for x < x_break1
+    alpha_2 : float
+        Power law index for x > x_break1 and x < x_break2
+    alpha_3 : float
+        Power law index for x > x_break2
+    e_cutoff : `~astropy.units.Quantity` float
+        Exponential Cutoff energy
+    beta : float, optional
+        Exponential cutoff rapidity. Default is 1.
+
+    See Also
+    --------
+    PowerLaw, ExponentialCutoffPowerLaw, LogParabola
+
+    Notes
+    -----
+    Model formula (with :math:`A` for ``amplitude``, :math:`E_0` for ``e_0``,
+    :math:`\\alpha_1` for ``alpha_1``, :math:`\\alpha_2` for ``alpha_2``,
+    :math:`E_{cutoff}` for ``e_cutoff``, and :math:`\\beta` for ``beta``):
+
+        .. math::
+
+
+            f(E) = \\exp(-(E / E_{cutoff})^\\beta)\\left \\{
+                     \\begin{array}{ll}
+                       A (E / E_0) ^ {-\\alpha_1}    & : E < E_{break} \\\\
+                       A (E_{break}/E_0) ^ {\\alpha_2-\\alpha_1}
+                            (E / E_0) ^ {-\\alpha_2} & : E > E_{break} \\\\
+                     \\end{array}
+                   \\right.
+
+    """
+
+    param_names = [
+        "amplitude",
+        "e_0",
+        "e_break1",
+        "e_break2",
+        "alpha_1",
+        "alpha_2",
+        "alpha_3",
+        "e_cutoff",
+        "beta",
+    ]
+    _memoize = False
+    _cache = {}
+    _queue = []
+
+    def __init__(
+        self, amplitude, e_0, e_break1, e_break2, alpha_1, alpha_2, alpha_3, e_cutoff, beta=1.0
+    ):
+        self.amplitude = amplitude
+        self.e_0 = validate_scalar(
+            "e_0", e_0, domain="positive", physical_type="energy"
+        )
+        self.e_break1 = validate_scalar(
+            "e_break1", e_break1, domain="positive", physical_type="energy"
+        )
+        self.e_break2 = validate_scalar(
+            "e_break2", e_break2, domain="positive", physical_type="energy"
+        )
+        self.alpha_1 = alpha_1
+        self.alpha_2 = alpha_2
+        self.alpha_3 = alpha_3
+        self.e_cutoff = validate_scalar(
+            "e_cutoff", e_cutoff, domain="positive", physical_type="energy"
+        )
+        self.beta = beta
+        
+    def ecbpl(self, e, amplitude, e_0, e_break, alpha_1, alpha_2, e_cutoff, beta):
+        K = np.where(e < e_break, 1, (e_break / e_0) ** (alpha_2 - alpha_1))
+        alpha = np.where(e < e_break, alpha_1, alpha_2)
+        ee2 = e / e_cutoff
+        return amplitude * K * (e / e_0) ** -alpha * np.exp(-(ee2 ** beta))
+
+    #@staticmethod
+    def eval(self, e, amplitude, e_0, e_break1, e_break2, alpha_1, alpha_2, alpha_3, e_cutoff, beta):
+        """One dimensional broken power law model function"""
+        final = np.where(e > e_break1,
+                        (1./amplitude)*self.ecbpl(e, amplitude, e_0, e_break2, alpha_2, alpha_3, e_cutoff, beta),
+                        (1./amplitude)*self.ecbpl(e_break1,amplitude, e_0, e_break2, alpha_2, alpha_3, e_cutoff, beta)*(e/e_break1)**-alpha_1)
+        #print(final * amplitude)
+        return final * amplitude
+
+    @memoize
+    def _calc(self, e):
+        return self.eval(
+            e.to("eV").value,
+            self.amplitude,
+            self.e_0.to("eV").value,
+            self.e_break1.to("eV").value,
+            self.e_break2.to("eV").value,
+            self.alpha_1,
+            self.alpha_2,
+            self.alpha_3,
             self.e_cutoff.to("eV").value,
             self.beta,
         )

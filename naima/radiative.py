@@ -31,8 +31,11 @@ from astropy.constants import c, m_e, hbar, sigma_sb, e, m_p, alpha
 
 __all__ = [
     "Synchrotron",
+    "TurbSynch",
     "InverseCompton",
     "PionDecay",
+    "ProtonSynch",
+    "TurbSynchProt",
     "Bremsstrahlung",
     "PionDecayKelner06",
 ]
@@ -44,7 +47,9 @@ log.setLevel(logging.INFO)
 e = e.gauss
 
 mec2 = (m_e * c ** 2).cgs
+mpc2 = (m_p * c ** 2).cgs
 mec2_unit = u.Unit(mec2)
+mpc2_unit = u.Unit(mpc2)
 
 ar = (4 * sigma_sb / c).to("erg/(cm3 K4)")
 r0 = (e ** 2 / mec2).to("cm")
@@ -358,7 +363,7 @@ class Synchrotron(BaseElectron):
             * self._gam ** 2
         )
         Ec /= 2 * (m_e * c).cgs.value
-
+        
         EgEc = outspecene.to("erg").value / np.vstack(Ec)
         dNdE = CS1 * Gtilde(EgEc)
         # return units
@@ -370,6 +375,201 @@ class Synchrotron(BaseElectron):
         spec = spec.to("1/(s eV)")
 
         return spec
+    
+    
+class Synch_PLBfield(BaseElectron):
+    """ Synchrotron emission from electron population in case the 
+    magnetic field has a PL distribution. The asymptotic implementation
+    is reported in Kelner,Aharonian,Khangulyan 2013
+    more on B field distribution is also in Eilek&Arendt,1996
+    
+    The class derives from Synchtroton. Assumes an isotropic distribution
+    in terms of pitch angle.
+    
+    The user gives the minimum Bfield 'Bmin' and the power law index 'r' of the 
+    distribution. The assumed distribution will have the form:
+    w(B)dB = g0 * (B/Bmin)**-r
+    between Bmin and Bmax = 100*Bmin
+    w(B)dB is the probability that B is between B and B+dB.
+    g0 is the normalization factor so that the integral of the probability is 1.
+    """
+    def __init__(self, particle_distribution, B=3.24e-6 * u.G, rb = 2.,**kwargs):
+        super(Synch_PLBfield, self).__init__(particle_distribution)
+        self.B = validate_scalar("B", B, physical_type="magnetic flux density")
+        self.Eemin = 1 * u.GeV
+        self.Eemax = 1e9 * mec2
+        self.nEed = 100
+        self.rb = rb
+        self.param_names += ["B"]
+        self.param_names += ["rb"]
+        self.__dict__.update(**kwargs)
+        
+    def _calcspec(self,Bfield,photon_energy):
+        '''
+        synch spectrum for fixed particle energy and fixed Bfield
+        '''
+        outspecene = _validate_ene(photon_energy)
+
+        from scipy.special import cbrt
+
+        def Gtilde(x):
+            """
+            AKP10 Eq. D7
+
+            Factor ~2 performance gain in using cbrt(x)**n vs x**(n/3.)
+            Invoking crbt only once reduced time by ~40%
+            """
+            cb = cbrt(x)
+            gt1 = 1.808 * cb / np.sqrt(1 + 3.4 * cb ** 2.0)
+            gt2 = 1 + 2.210 * cb ** 2.0 + 0.347 * cb ** 4.0
+            gt3 = 1 + 1.353 * cb ** 2.0 + 0.217 * cb ** 4.0
+            return gt1 * (gt2 / gt3) * np.exp(-x)
+
+        log.debug("calc_sy: Starting synchrotron computation with AKB2010...")
+
+        # strip units, ensuring correct conversion
+        # astropy units do not convert correctly for gyroradius calculation
+        # when using cgs (SI is fine, see
+        # https://github.com/astropy/astropy/issues/1687)
+        CS1_0 = np.sqrt(3) * e.value ** 3 * np.vstack(Bfield.to("G").value)
+        CS1_1 = (
+            2
+            * np.pi
+            * m_e.cgs.value
+            * c.cgs.value ** 2
+            * hbar.cgs.value
+            * outspecene.to("erg").value
+        )
+        CS1 = CS1_0 / CS1_1
+
+        # Critical energy, erg
+        Ec = (
+            3
+            * e.value
+            * hbar.cgs.value
+            * np.vstack(Bfield.to("G").value)
+            * self._gam ** 2
+        )
+        Ec /= 2 * (m_e * c).cgs.value
+        EgEc = np.array([phel / np.vstack(Ec) for phel in outspecene.to("erg").value]).T
+        dNdE = CS1 * Gtilde(EgEc)
+        return dNdE
+       
+    def _spectrum(self,photon_energy):
+        '''
+        Compute the normalization for the B field distribution
+        '''
+        import scipy.integrate as spi
+        
+        BM = 1000.*self.B #fixing the high bound to 100 times the minimum value
+        Bm = self.B
+        r = self.rb
+        Bvals = np.logspace(np.log10(Bm.value),np.log10(BM.value),100)*self.B.unit
+        norm = ((1.-r)/(Bm*((BM/Bm)**(1.-r)-1.)))
+        
+        def bfielddist(B,n,bm,r):
+            return n*(B/bm)**-r
+        
+        #def funct(x,n,bm,r,photon_energy):
+        #    return (bfielddist(x,n,bm,r)*self._calcspec(x,photon_energy*u.eV)).value
+        #print(photon_energy.shape)
+        #print(Bvals.shape)
+        #print(self._calcspec(Bvals,photon_energy).shape)
+        #print(self._gam.shape)
+        #print(np.vstack(bfielddist(Bvals,norm,Bm,r)).unit)
+        #print(Bvals.unit)
+        spec_g = trapz_loglog(self._calcspec(Bvals,photon_energy)*np.vstack(bfielddist(Bvals,norm,Bm,r))/self.B.unit,Bvals,axis=1)
+        #spec_g = self._calcspec(Bvals,photon_energy)
+        #print(spec_g.unit)
+        
+        spec = (
+            trapz_loglog(np.vstack(self._nelec) * spec_g, self._gam, axis=0)
+            / u.s
+            / u.erg
+        )
+        spec = spec.to("1/(s eV)")
+        return spec
+        
+        
+
+
+class TurbSynch(BaseElectron):
+    """Synchrotron emission from an electron population in case of turbulent
+    magnetic field with Gaussian distribution with sigma B_0
+
+    The class uses the derivation in Derishev&Aharonian,2019, in prep.
+    
+    The class assumes furthermore an isotropic distribution of electrons
+    in terms of pitch angle.
+
+    Parameters
+    ----------
+    particle_distribution : function
+        Particle distribution function, taking electron energies as a
+        `~astropy.units.Quantity` array or float, and returning the particle
+        energy density in units of number of electrons per unit energy as a
+        `~astropy.units.Quantity` array or float.
+
+    B : :class:`~astropy.units.Quantity` float instance, optional
+        Isotropic magnetic field strength. Default: equipartition
+        with CMB (3.24e-6 G)
+
+    Other parameters
+    ----------------
+    Eemin : :class:`~astropy.units.Quantity` float instance, optional
+        Minimum electron energy for the electron distribution. Default is 1
+        GeV.
+
+    Eemax : :class:`~astropy.units.Quantity` float instance, optional
+        Maximum electron energy for the electron distribution. Default is 510
+        TeV.
+
+    nEed : scalar
+        Number of points per decade in energy for the electron energy and
+        distribution arrays. Default is 100.
+    """
+
+    def __init__(self, particle_distribution, B=3.24e-6 * u.G, **kwargs):
+        super(TurbSynch, self).__init__(particle_distribution)
+        self.B = validate_scalar("B", B, physical_type="magnetic flux density")
+        self.Eemin = 1 * u.GeV
+        self.Eemax = 1e9 * mec2
+        self.nEed = 100
+        self.param_names += ["B"]
+        self.__dict__.update(**kwargs)
+
+    def _spectrum(self, photon_energy):
+        """Compute intrinsic synchrotron differential spectrum for energies in
+        ``photon_energy``
+
+        Compute synchrotron for random turbulent magnetic fiels according
+        to Derishev&Aharonian,2019 in prep.
+        formulae 10 and 11
+
+        Parameters
+        ----------
+        photon_energy : :class:`~astropy.units.Quantity` instance
+            Photon energy array.
+        """
+
+        outspecene = _validate_ene(photon_energy)
+        
+        #modified expression for the characteristic energy
+        Ecm = 4./3.*e.value*self.B.to("G").value/m_e.cgs.value/c.cgs.value*self._gam**2*(hbar.cgs.value) #in units of energy
+        newx= outspecene.to("erg").value / np.vstack(Ecm)
+        dNdE = 1./(np.vstack(self._gam))**2*alpha/(hbar.cgs.value)/3.*(1.+1./(newx**(2./3.)))*np.exp(-2.*newx**(2./3.))
+        
+        # return units
+        spec = (
+            trapz_loglog(np.vstack(self._nelec) * dNdE, self._gam, axis=0)
+            / u.s
+            / u.erg
+        )
+        spec = spec.to("1/(s eV)")
+
+        return spec
+
+
 
 
 def G12(x, a):
@@ -1062,6 +1262,27 @@ class BaseProton(BaseRadiative):
         self._memoize = True
         self._cache = {}
         self._queue = []
+        
+    """
+    properties taken from the electron class
+    and needed for the proton synchrotron
+    """
+    @property
+    def _gam(self):
+        """Lorentz factor array
+        """
+        log10gmin = np.log10(self.Epmin / mpc2).value
+        log10gmax = np.log10(self.Epmax / mpc2).value
+        return np.logspace(
+            log10gmin, log10gmax, int(self.nEpd * (log10gmax - log10gmin))
+        )
+    
+    @property
+    def _nprot(self):
+        """ Particles per unit lorentz factor
+        """
+        pd = self.particle_distribution(self._gam * mpc2)
+        return pd.to(1 / mpc2_unit).value
 
     @property
     def _Ep(self):
@@ -1852,6 +2073,198 @@ class PionDecayKelner06(BaseRadiative):
         density_factor = (self.nh / (1 * u.Unit("1/cm3"))).decompose().value
 
         return density_factor * self.specpp.to("1/(s eV)")
+
+
+class ProtonSynch(BaseProton):
+    """Synchrotron emission from a proton population.
+
+    This class uses the approximation of the synchrotron emissivity in a
+    random magnetic field of Aharonian, Kelner, and Prosekin 2010, PhysRev D
+    82, 3002 (`arXiv:1006.1045 <http://arxiv.org/abs/1006.1045>`_).
+
+    Parameters
+    ----------
+    particle_distribution : function
+        Particle distribution function, taking electron energies as a
+        `~astropy.units.Quantity` array or float, and returning the particle
+        energy density in units of number of protons per unit energy as a
+        `~astropy.units.Quantity` array or float.
+
+    B : :class:`~astropy.units.Quantity` float instance, optional
+        Isotropic magnetic field strength. Default: equipartition
+        with CMB (3.24e-6 G)
+
+    Other parameters
+    ----------------
+    Eemin : :class:`~astropy.units.Quantity` float instance, optional
+        Minimum proton energy for the proton distribution. Default is 1
+        GeV.
+
+    Eemax : :class:`~astropy.units.Quantity` float instance, optional
+        Maximum proton energy for the proton distribution. Default is 510
+        TeV.
+
+    nEed : scalar
+        Number of points per decade in energy for the proton energy and
+        distribution arrays. Default is 100.
+    """
+
+    def __init__(self, particle_distribution, B=3.24e-6 * u.G, **kwargs):
+        super(ProtonSynch, self).__init__(particle_distribution)
+        self.B = validate_scalar("B", B, physical_type="magnetic flux density")
+        self.Epmin = 1 * u.GeV
+        self.Epmax = 1e15 * mpc2
+        self.nEpd = 200
+        self.param_names += ["B"]
+        self.__dict__.update(**kwargs)
+
+    def _spectrum(self, photon_energy):
+        """Compute intrinsic synchrotron differential spectrum for energies in
+        ``photon_energy``
+
+        Compute synchrotron for random magnetic field according to
+        approximation of Aharonian, Kelner, and Prosekin 2010, PhysRev D 82,
+        3002 (`arXiv:1006.1045 <http://arxiv.org/abs/1006.1045>`_).
+
+        Parameters
+        ----------
+        photon_energy : :class:`~astropy.units.Quantity` instance
+            Photon energy array.
+        """
+
+        outspecene = _validate_ene(photon_energy)
+
+        from scipy.special import cbrt
+
+        def Gtilde(x):
+            """
+            AKP10 Eq. D7
+
+            Factor ~2 performance gain in using cbrt(x)**n vs x**(n/3.)
+            Invoking crbt only once reduced time by ~40%
+            """
+            cb = cbrt(x)
+            gt1 = 1.808 * cb / np.sqrt(1 + 3.4 * cb ** 2.0)
+            gt2 = 1 + 2.210 * cb ** 2.0 + 0.347 * cb ** 4.0
+            gt3 = 1 + 1.353 * cb ** 2.0 + 0.217 * cb ** 4.0
+            return gt1 * (gt2 / gt3) * np.exp(-x)
+
+        log.debug("calc_sy: Starting synchrotron computation with AKB2010...")
+
+        # strip units, ensuring correct conversion
+        # astropy units do not convert correctly for gyroradius calculation
+        # when using cgs (SI is fine, see
+        # https://github.com/astropy/astropy/issues/1687)
+        CS1_0 = np.sqrt(3) * e.value ** 3 * self.B.to("G").value
+        CS1_1 = (
+            2
+            * np.pi
+            * m_p.cgs.value
+            * c.cgs.value ** 2
+            * hbar.cgs.value
+            * outspecene.to("erg").value
+        )
+        CS1 = CS1_0 / CS1_1
+
+        # Critical energy, erg
+        Ec = (
+            3
+            * e.value
+            * hbar.cgs.value
+            * self.B.to("G").value
+            * self._gam ** 2
+        )
+        Ec /= 2 * (m_p * c).cgs.value
+
+        EgEc = outspecene.to("erg").value / np.vstack(Ec)
+        dNdE = CS1 * Gtilde(EgEc)
+        # return units
+        spec = (
+            trapz_loglog(np.vstack(self._nprot) * dNdE, self._gam, axis=0)
+            / u.s
+            / u.erg
+        )
+        spec = spec.to("1/(s eV)")
+
+        return spec
+
+
+class TurbSynchProt(BaseProton):
+    """Synchrotron emission from an proton population in case of turbulent
+    magnetic field with Gaussian distribution with sigma B_0
+
+    The class uses the derivation in Derishev&Aharonian,2019, in prep.
+    
+    The class assumes furthermore an isotropic distribution of protons
+    in terms of pitch angle.
+
+    Parameters
+    ----------
+    particle_distribution : function
+        Particle distribution function, taking protons energies as a
+        `~astropy.units.Quantity` array or float, and returning the particle
+        energy density in units of number of protons per unit energy as a
+        `~astropy.units.Quantity` array or float.
+
+    B : :class:`~astropy.units.Quantity` float instance, optional
+        Isotropic magnetic field strength. Default: equipartition
+        with CMB (3.24e-6 G)
+
+    Other parameters
+    ----------------
+    Eemin : :class:`~astropy.units.Quantity` float instance, optional
+        Minimum proton energy for the proton distribution. Default is 1
+        GeV.
+
+    Eemax : :class:`~astropy.units.Quantity` float instance, optional
+        Maximum electron energy for the proton distribution. Default is 510
+        TeV.
+
+    nEed : scalar
+        Number of points per decade in energy for the proton energy and
+        distribution arrays. Default is 100.
+    """
+
+    def __init__(self, particle_distribution, B=3.24e-6 * u.G, **kwargs):
+        super(TurbSynchProt, self).__init__(particle_distribution)
+        self.B = validate_scalar("B", B, physical_type="magnetic flux density")
+        self.Epmin = 1 * u.GeV
+        self.Epmax = 1e15 * mpc2
+        self.nEpd = 100
+        self.param_names += ["B"]
+        self.__dict__.update(**kwargs)
+
+    def _spectrum(self, photon_energy):
+        """Compute intrinsic synchrotron differential spectrum for energies in
+        ``photon_energy``
+
+        Compute synchrotron for random turbulent magnetic fiels according
+        to Derishev&Aharonian,2019 in prep.
+        formulae 10 and 11
+
+        Parameters
+        ----------
+        photon_energy : :class:`~astropy.units.Quantity` instance
+            Photon energy array.
+        """
+
+        outspecene = _validate_ene(photon_energy)
+        
+        #modified expression for the characteristic energy
+        Ecm = 4./3.*e.value*self.B.to("G").value/m_p.cgs.value/c.cgs.value*self._gam**2*(hbar.cgs.value) #in units of energy
+        newx= outspecene.to("erg").value / np.vstack(Ecm)
+        dNdE = 1./(np.vstack(self._gam))**2*alpha/(hbar.cgs.value)/3.*(1.+1./(newx**(2./3.)))*np.exp(-2.*newx**(2./3.))
+        
+        # return units
+        spec = (
+            trapz_loglog(np.vstack(self._nprot) * dNdE, self._gam, axis=0)
+            / u.s
+            / u.erg
+        )
+        spec = spec.to("1/(s eV)")
+
+        return spec
+
 
 
 class LookupTable(object):
